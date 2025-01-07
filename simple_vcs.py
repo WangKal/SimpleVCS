@@ -6,6 +6,7 @@ import shutil
 import logging
 from pathlib import Path
 from unittest.mock import patch
+from difflib import unified_diff
 
 # Set up a logger for SimpleVCS
 logger = logging.getLogger("SimpleVCS")
@@ -18,6 +19,7 @@ class SimpleVCS:
     def __init__(self, repo_path):
         self.repo_path = Path(repo_path)
         self.repo_dir = self.repo_path / ".repo"
+        self.remote_dir = self.repo_path / ".remote"
         self.commits_dir = self.repo_dir / "commits"
         self.branches_file = self.repo_dir / "branches.json"
         self.index_file = self.repo_dir / "index.json"
@@ -35,11 +37,15 @@ class SimpleVCS:
             return
 
         self.repo_dir.mkdir(parents=True)
+        self.remote_dir.mkdir(parents=True)
         self.commits_dir.mkdir()
+        self.main_folder = self.commits_dir / "main"
+        self.main_folder.mkdir()
         self.branches_file.write_text(json.dumps({"main": None}))
         self.index_file.write_text(json.dumps({}))
         self.head_file.write_text("main")
-
+        
+    
         print("Repository initialized.")
 
     def add(self, file_path):
@@ -58,14 +64,13 @@ class SimpleVCS:
             print(f"File '{file_path}' does not exist.")
             return
 
-        with self.index_file.open("r+") as index:
-            staging_area = json.load(index)
-            staging_area[file_path] = full_path.stat().st_mtime
-            index.seek(0)
-            json.dump(staging_area, index)
-            index.truncate()
+        staging_area = self.repo_dir / "staging"
+        os.makedirs(staging_area, exist_ok=True)
+    
+        shutil.copy(full_path, staging_area)
+        print(f"File '{file_path}' added to staging area.")
+        
 
-        print(f"Added '{file_path}' to staging area.")
 
     def commit(self, message):
         """
@@ -77,39 +82,54 @@ class SimpleVCS:
         if not self.repo_dir.exists():
             print("Repository not initialized. Run 'init' first.")
             return
-
-        with self.index_file.open("r") as index:
-            staging_area = json.load(index)
-
-        if not staging_area:
-            print("No changes to commit.")
-            return
-
-        commit_hash = hashlib.sha1(f"{time.time()}".encode()).hexdigest()
-
-        commit_data = {
-            "message": message,
-            "files": staging_area,
-            "timestamp": time.time(),
-        }
-
-        with (self.commits_dir / commit_hash).open("w") as commit_file:
-            json.dump(commit_data, commit_file)
-
+        
         with self.head_file.open("r") as head_file:
             current_branch = head_file.read().strip()
 
-        with self.branches_file.open("r+") as branches_file:
-            branches = json.load(branches_file)
-            branches[current_branch] = commit_hash
-            branches_file.seek(0)
-            json.dump(branches, branches_file)
-            branches_file.truncate()
+        branch_dir = self.repo_dir / "commits" / current_branch
+        staging_area = self.repo_dir / "staging"
 
-        with self.index_file.open("w") as index:
-            json.dump({}, index)
+        if not os.listdir(staging_area):
+            print("No changes to commit.")
+            return
 
-        print(f"Committed changes with hash {commit_hash}. Message: '{message}'")
+        commit_id = len(os.listdir(branch_dir))
+        commit_dir = os.path.join(branch_dir, f"commit_{commit_id}")
+        os.makedirs(commit_dir)
+
+        for file_name in os.listdir(staging_area):
+            shutil.move(os.path.join(staging_area, file_name), commit_dir)
+
+        with open(os.path.join(commit_dir, "message.txt"), "w") as f:
+            f.write(message)
+
+        print(f"Committed changes to {current_branch} with message: {message}")
+
+
+
+    # Push changes to the remote repository
+    def push(self):
+        with self.head_file.open("r") as head_file:
+            current_branch = head_file.read().strip()
+
+        local_branch = self.repo_dir / "commits" / current_branch
+        remote_branch = self.remote_dir / "commits" / current_branch
+
+        if not os.path.exists(local_branch):
+            print(f"No commits to push for branch '{current_branch}'.")
+            return
+
+        if not os.path.exists(remote_branch):
+            os.makedirs(remote_branch)
+
+        for commit in os.listdir(local_branch):
+            local_commit = os.path.join(local_branch, commit)
+            remote_commit = os.path.join(remote_branch, commit)
+            if not os.path.exists(remote_commit):
+                shutil.copytree(local_commit, remote_commit)
+
+        print(f"Pushed changes from branch '{current_branch}' to remote.")
+
 
     def history(self):
         """
@@ -168,7 +188,12 @@ class SimpleVCS:
             json.dump(branches, branches_file)
             branches_file.truncate()
 
-        print(f"Branch '{branch_name}' created.")
+            
+            new_branch_path = self.repo_dir / "commits" / branch_name
+
+            os.makedirs(new_branch_path)
+
+            print(f"Branch '{branch_name}' created.")
 
     def list_branches(self):
         """
@@ -237,8 +262,6 @@ class SimpleVCS:
         with self.index_file.open("w") as index:
             json.dump({}, index)
 
-        # Here you could load the files from the commit into the working directory
-        # For simplicity, this function doesn't handle file restoration, but you can implement it.
         print(f"Workspace switched to branch '{branch_name}'. Staging area cleared.")
 
     def clone(self, target_path):
@@ -326,28 +349,81 @@ class SimpleVCS:
                     logger.info(f"File: {file}")
                     yield file
 
-    def diff(self, branch1, branch2):
-        branch1_path = self.repo_path / branch1
-        branch2_path = self.repo_path / branch2
+    def get_files_in_directory(self,directory):
+        """Recursively get all files in a directory and its subdirectories."""
+        files = []
+        for root, dirs, filenames in os.walk(directory):
+            for filename in filenames:
+                files.append(os.path.relpath(os.path.join(root, filename), directory))
+        return files
 
-        if not branch1_path.exists() or not branch2_path.exists():
-            print("One or both branches do not exist.")
+    def diff(self,branch1, branch2):
+        """
+        Compares the contents of all files in two branches (folders) and prints the differences.
+        """
+        branch1 = self.repo_dir / "commits" / branch1
+        branch2 = self.repo_dir / "commits" / branch2
+
+        if not os.path.isdir(branch1):
+            print(f"Error: Branch 1 not found: {branch1}")
+            return
+        if not os.path.isdir(branch2):
+            print(f"Error: Branch 2 not found: {branch2}")
             return
 
-        branch1_files = {str(file.relative_to(branch1_path)) for file in branch1_path.rglob('*') if file.is_file()}
-        branch2_files = {str(file.relative_to(branch2_path)) for file in branch2_path.rglob('*') if file.is_file()}
+        try:
+            # Get all files (including subdirectories) in both branches
+            branch1_files = set(self.get_files_in_directory(branch1))
+            branch2_files = set(self.get_files_in_directory(branch2))
 
-        added = branch2_files - branch1_files
-        removed = branch1_files - branch2_files
-        modified = {file for file in branch1_files & branch2_files
-                    if (branch1_path / file).read_bytes() != (branch2_path / file).read_bytes()}
+            print(f"Files in Branch 1: {branch1_files}")
+            print(f"Files in Branch 2: {branch2_files}")
 
-        print("Files added:", added)
-        print("Files modified:", modified)
+            # Find common files, added files, and removed files
+            common_files = branch1_files & branch2_files
+            added_files = branch2_files - branch1_files
+            removed_files = branch1_files - branch2_files
+
+            print(f"Common files: {common_files}")
+            print(f"Added files in Branch 2: {added_files}")
+            print(f"Removed files from Branch 1: {removed_files}")
+
+            # Compare common files
+            for file in common_files:
+                path1 = os.path.join(branch1, file)
+                path2 = os.path.join(branch2, file)
+
+                if os.path.isfile(path1) and os.path.isfile(path2):
+                    with open(path1, 'r') as f1, open(path2, 'r') as f2:
+                        content1 = f1.readlines()
+                        content2 = f2.readlines()
+
+                    file_diff = list(unified_diff(content1, content2, 
+                                                  fromfile=f"Branch 1: {file}", 
+                                                  tofile=f"Branch 2: {file}"))
+
+                    if file_diff:
+                        print(f"Differences in file: {file}")
+                        print(''.join(file_diff))
+                    else:
+                        print(f"No differences in file: {file}")
+
+            # Handle added files
+            for file in added_files:
+                print(f"File added in Branch 2: {file}")
+
+            # Handle removed files
+            for file in removed_files:
+                print(f"File removed in Branch 1: {file}")
+
+        except PermissionError as e:
+            print(f"Permission denied: {e}")
+        except Exception as e:
+            print(f"An error occurred: {e}")
 
     def merge(self, source_branch, target_branch):
-        source_path = self.repo_path / source_branch
-        target_path = self.repo_path / target_branch
+        source_path = self.repo_dir / "commits" / source_branch
+        target_path = self.repo_dir / "commits" /target_branch
 
         if not source_path.exists() or not target_path.exists():
             print("One or both branches do not exist.")
@@ -359,9 +435,9 @@ class SimpleVCS:
             if file.is_file():
                 rel_path = file.relative_to(source_path)
                 target_file = target_path / rel_path
-
-                if target_file.exists() and file.read_bytes() != target_file.read_bytes():
-                    conflicts.append(str(rel_path))  # Convert Path to string
+                file_name = os.path.basename(file)
+                if target_file.exists() and file_name != "message.txt" and file.read_bytes() != target_file.read_bytes():
+                    conflicts.append(file)  # Convert Path to string
                 else:
                     target_file.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(file, target_file)
