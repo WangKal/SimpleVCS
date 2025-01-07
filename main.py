@@ -42,6 +42,9 @@ add_parser.add_argument("--file", required=True, help="File to add")
 commit_parser = subparsers.add_parser("commit", help="Commit changes to the repository")
 commit_parser.add_argument("--message", required=True, help="Commit message")
 
+# Push command
+subparsers.add_parser("push", help="Push files from a branch to remote")
+
 # History command
 subparsers.add_parser("history", help="View commit history")
 
@@ -101,6 +104,8 @@ elif args.command == "commit":
         vcs.commit(args.message)
     else:
         print("Specify a commit message using --message.")
+elif args.command == "push":
+    vcs.push()
 elif args.command == "history":
     vcs.history()
 elif args.command == "branch":
